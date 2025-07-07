@@ -1,0 +1,354 @@
+import torch
+import argparse
+import torch.nn as nn
+import torch.utils.data as Data
+import torch.backends.cudnn as cudnn
+from scipy.io import loadmat, savemat
+from torch import optim
+from vit_pytorch import ViT
+from sklearn.metrics import confusion_matrix, accuracy_score, cohen_kappa_score
+
+import matplotlib.pyplot as plt
+from matplotlib import colors
+import numpy as np
+import time
+import os
+
+# --- 1. 하이퍼파라미터 및 실행 옵션 설정 ---
+parser = argparse.ArgumentParser("HSI-Classification")
+parser.add_argument('--dataset', choices=['Indian', 'Pavia', 'Houston'], default='Indian', help='사용할 데이터셋 선택')
+parser.add_argument('--mode', choices=['ViT', 'CAF'], default='ViT', help='모델 아키텍처 선택 (ViT: 기본, CAF: SpectralFormer)')
+parser.add_argument('--flag_test', choices=['test', 'train'], default='train', help='실행 모드 (train 또는 test)')
+parser.add_argument('--gpu_id', default='0', help='사용할 GPU ID')
+parser.add_argument('--seed', type=int, default=0, help='재현성을 위한 랜덤 시드')
+parser.add_argument('--batch_size', type=int, default=64, help='배치 사이즈')
+parser.add_argument('--epoches', type=int, default=200, help='총 훈련 에폭 수')
+parser.add_argument('--patches', type=int, default=7, help='공간 패치 크기 (e.g., 7 -> 7x7 패치)')
+parser.add_argument('--band_patches', type=int, default=3, help='그룹별 분광 임베딩(GSE)을 위한 인접 밴드 수 (홀수 권장)')
+parser.add_argument('--test_freq', type=int, default=10, help='검증 주기 (몇 에폭마다 검증할지)')
+parser.add_argument('--learning_rate', type=float, default=5e-4, help='학습률')
+parser.add_argument('--gamma', type=float, default=0.9, help='학습률 스케줄러의 감마 값')
+parser.add_argument('--weight_decay', type=float, default=0, help='가중치 감쇠 (L2 정규화)')
+args = parser.parse_args()
+
+# 모델 파일 이름 동적 생성
+MODEL_FILENAME = f'./best_model_{args.dataset}_{args.mode}_patch{args.patches}.pt'
+
+# GPU 설정
+os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_id)
+
+# 재현성을 위한 시드 고정
+np.random.seed(args.seed)
+torch.manual_seed(args.seed)
+torch.cuda.manual_seed(args.seed)
+cudnn.deterministic = True
+cudnn.benchmark = False
+
+# --- 2. 데이터 전처리 관련 함수 ---
+
+def chooose_train_and_test_point(train_data, test_data, true_data, num_classes):
+    """훈련, 테스트, 전체 데이터의 좌표를 찾아서 반환하는 함수"""
+    pos_train, pos_test, pos_true = {}, {}, {}
+    number_train, number_test, number_true = [], [], []
+
+    for i in range(num_classes):
+        pos_train[i] = np.argwhere(train_data == (i + 1))
+        number_train.append(pos_train[i].shape[0])
+        pos_test[i] = np.argwhere(test_data == (i + 1))
+        number_test.append(pos_test[i].shape[0])
+
+    total_pos_train = np.concatenate(list(pos_train.values()), axis=0).astype(int)
+    total_pos_test = np.concatenate(list(pos_test.values()), axis=0).astype(int)
+
+    for i in range(num_classes + 1): # 0번 클래스 (배경) 포함
+        pos_true[i] = np.argwhere(true_data == i)
+        number_true.append(pos_true[i].shape[0])
+
+    total_pos_true = np.concatenate(list(pos_true.values()), axis=0).astype(int)
+
+    return total_pos_train, total_pos_test, total_pos_true, number_train, number_test, number_true
+
+def mirror_hsi(height, width, band, input_normalize, patch=7):
+    """이미지 경계를 미러링하여 공간 패딩을 적용하는 함수"""
+    padding = patch // 2
+    mirror_hsi = np.zeros((height + 2 * padding, width + 2 * padding, band), dtype=float)
+    mirror_hsi[padding:(padding + height), padding:(padding + width), :] = input_normalize
+
+    # 상하좌우 경계 미러링
+    mirror_hsi[0:padding, :, :] = mirror_hsi[padding:2*padding, :, :][::-1, :, :] # Top
+    mirror_hsi[-padding:, :, :] = mirror_hsi[-2*padding:-padding, :, :][::-1, :, :] # Bottom
+    mirror_hsi[:, 0:padding, :] = mirror_hsi[:, padding:2*padding, :][:, ::-1, :] # Left
+    mirror_hsi[:, -padding:, :] = mirror_hsi[:, -2*padding:-padding, :][:, ::-1, :] # Right
+
+    print("--- Data Preprocessing ---")
+    print(f"Spatial patch size: {patch}x{patch}")
+    print(f"Mirrored HSI shape: {mirror_hsi.shape}")
+    return mirror_hsi
+
+def create_dataset(mirror_image, points, band, patch_size, band_patch):
+    """
+    주어진 좌표(points)에 대해 공간-분광 특징 벡터를 추출하여
+    (샘플 수, 밴드 수, 특징 벡터 차원) 형태의 최종 데이터셋을 생성합니다.
+    """
+    n_points = points.shape[0]
+    print(f"\nCreating dataset for {n_points} samples...")
+    
+    # 1. 공간 패치 추출: (샘플 수, 패치, 패치, 밴드)
+    spatial_patches = np.zeros((n_points, patch_size, patch_size, band), dtype=np.float32)
+    for i, (r, c) in enumerate(points):
+        spatial_patches[i, :, :, :] = mirror_image[r:(r + patch_size), c:(c + patch_size), :]
+    
+    # 2. 데이터 축 변환 및 리쉐잎: (샘플 수, 밴드, 공간픽셀)
+    data_transposed = spatial_patches.transpose(0, 3, 1, 2).reshape(n_points, band, -1)
+
+    # 3. 분광 차원 패딩 ('edge' 모드로 경계 복제)
+    half_patch = band_patch // 2
+    data_padded = np.pad(data_transposed, ((0, 0), (half_patch, half_patch), (0, 0)), 'edge')
+
+    # 4. 분광 특징 벡터 생성
+    feature_dim = (patch_size**2) * band_patch
+    final_features = np.zeros((n_points, band, feature_dim), dtype=np.float32)
+    for i in range(band):
+        spectral_window = data_padded[:, i:(i + band_patch), :]
+        final_features[:, i, :] = spectral_window.reshape(n_points, -1)
+        
+    print(f"Final dataset shape: {final_features.shape} -> (Samples, Bands, Features)")
+    return final_features
+
+def create_labels(number_list, num_classes, include_background=False):
+    """클래스별 샘플 수에 따라 라벨 배열을 생성하는 헬퍼 함수"""
+    labels = []
+    start_class = 0 if include_background else 1
+    
+    for i in range(len(number_list)):
+        class_label = (i + start_class) if include_background else i
+        labels.extend([class_label] * number_list[i])
+        
+    # 훈련/테스트 데이터는 라벨이 0부터 시작해야 함
+    if not include_background:
+        return np.array(labels, dtype=np.int64)
+    else: # 전체 데이터(true)는 배경(0)을 포함
+        return np.array(labels, dtype=np.int64)
+
+def train_and_test_label(number_train, number_test, number_true, num_classes):
+    """데이터에 맞는 라벨(y) 배열을 생성하는 메인 함수"""
+    y_train = create_labels(number_train, num_classes)
+    y_test = create_labels(number_test, num_classes)
+    y_true = create_labels(number_true, num_classes, include_background=True)
+    
+    print("\n--- Label Shapes ---")
+    print(f"y_train: shape = {y_train.shape}")
+    print(f"y_test:  shape = {y_test.shape}")
+    print(f"y_true:  shape = {y_true.shape}")
+    print("--------------------")
+    return y_train, y_test, y_true
+
+
+# --- 3. 훈련 유틸리티 함수 ---
+
+class AverageMeter(object):
+    """값들의 평균과 합계를 계산하고 저장하는 클래스"""
+    def __init__(self): self.reset()
+    def reset(self): self.avg, self.sum, self.cnt = 0, 0, 0
+    def update(self, val, n=1):
+        self.sum += val * n
+        self.cnt += n
+        self.avg = self.sum / self.cnt
+
+def calculate_metrics(output, target):
+    """모델의 예측과 실제 라벨을 비교하여 정확도 및 기타 정보를 계산"""
+    _, pred = output.topk(1, 1, True, True)
+    pred = pred.t()
+    correct = pred.eq(target.view(1, -1).expand_as(pred))
+    acc = correct[0].reshape(-1).float().sum(0) * 100.0 / target.size(0)
+    return acc, target.cpu().numpy(), pred.squeeze().cpu().numpy()
+
+def train_epoch(model, train_loader, criterion, optimizer):
+    """1 에폭(epoch) 동안 모델을 훈련시키는 함수"""
+    model.train()
+    losses, accuracies = AverageMeter(), AverageMeter()
+
+    for batch_data, batch_target in train_loader:
+        batch_data, batch_target = batch_data.cuda(), batch_target.cuda()
+
+        optimizer.zero_grad()
+        batch_pred = model(batch_data)
+        loss = criterion(batch_pred, batch_target)
+        loss.backward()
+        optimizer.step()
+
+        acc, _, _ = calculate_metrics(batch_pred, batch_target)
+        losses.update(loss.item(), batch_data.size(0))
+        accuracies.update(acc.item(), batch_data.size(0))
+
+    return accuracies.avg, losses.avg
+
+def valid_epoch(model, valid_loader):
+    """모델을 검증(validation)하는 함수 (파라미터 업데이트 없음)"""
+    model.eval()
+    all_targets, all_preds = np.array([]), np.array([])
+
+    with torch.no_grad():
+        for batch_data, batch_target in valid_loader:
+            batch_data, batch_target = batch_data.cuda(), batch_target.cuda()
+            batch_pred = model(batch_data)
+            _, t, p = calculate_metrics(batch_pred, batch_target)
+            all_targets = np.append(all_targets, t)
+            all_preds = np.append(all_preds, p)
+
+    return all_targets, all_preds
+
+def test_and_visualize(model, test_loader, true_points, y_true, height, width, color_map, ground_truth_map):
+    """전체 이미지에 대한 예측을 수행하고 분류 지도를 생성 및 시각화"""
+    model.eval()
+    all_preds = np.array([])
+    with torch.no_grad():
+        for batch_data, _ in test_loader:
+            batch_data = batch_data.cuda()
+            batch_pred = model(batch_data)
+            _, pred = batch_pred.topk(1, 1, True, True)
+            all_preds = np.append(all_preds, pred.squeeze().cpu().numpy())
+    
+    # 전체 맵 생성
+    prediction_map = np.zeros((height, width))
+    for i, (r, c) in enumerate(true_points):
+        if y_true[i] != 0: # 배경(라벨 0)이 아닌 픽셀만 예측값으로 채움
+            prediction_map[r, c] = all_preds[i] + 1
+    
+    # 시각화
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+    ax1.imshow(prediction_map, cmap=colors.ListedColormap(color_map))
+    ax1.set_title(f'{args.dataset} Classification Map ({args.mode})')
+    ax1.axis('off')
+    
+    ax2.imshow(ground_truth_map, cmap=colors.ListedColormap(color_map))
+    ax2.set_title('Ground Truth')
+    ax2.axis('off')
+    
+    plt.show()
+    
+    # .mat 파일로 저장
+    save_filename = f'prediction_{args.dataset}_{args.mode}_patch{args.patches}.mat'
+    savemat(save_filename, {'prediction': prediction_map, 'ground_truth': ground_truth_map})
+    print(f"Prediction map saved to {save_filename}")
+
+def output_metric(tar, pre):
+    """성능 지표(OA, AA, Kappa)를 계산하고 출력하는 함수"""
+    matrix = confusion_matrix(tar, pre)
+    class_accuracy = np.diag(matrix) / matrix.sum(axis=1)
+    AA = np.mean(class_accuracy) # Average Accuracy
+    OA = accuracy_score(tar, pre) # Overall Accuracy
+    Kappa = cohen_kappa_score(tar, pre)
+    return OA, AA, Kappa, class_accuracy
+
+# --- 4. 메인 스크립트 실행 ---
+
+# 데이터셋 로드
+print(f"Loading {args.dataset} dataset...")
+if args.dataset == 'Indian':
+    data = loadmat('./data/IndianPine.mat')
+elif args.dataset == 'Pavia':
+    data = loadmat('./data/Pavia.mat')
+elif args.dataset == 'Houston':
+    data = loadmat('./data/Houston.mat')
+else:
+    raise ValueError("Unknown dataset")
+
+color_mat = loadmat('./data/AVIRIS_colormap.mat')
+TR = data['TR']
+TE = data['TE']
+input_data = data['input']
+label = TR + TE
+num_classes = np.max(TR)
+color_matrix = color_mat[list(color_mat.keys())[-1]]
+
+# 데이터 정규화 (0~1)
+input_normalize = np.zeros_like(input_data, dtype=float)
+for i in range(input_data.shape[2]):
+    input_max, input_min = np.max(input_data[:, :, i]), np.min(input_data[:, :, i])
+    input_normalize[:, :, i] = (input_data[:, :, i] - input_min) / (input_max - input_min)
+
+height, width, band = input_data.shape
+print(f"HSI data shape: height={height}, width={width}, bands={band}")
+
+# 데이터 좌표 및 라벨 생성
+total_pos_train, total_pos_test, total_pos_true, num_train, num_test, num_true = chooose_train_and_test_point(TR, TE, label, num_classes)
+y_train, y_test, y_true = train_and_test_label(num_train, num_test, num_true, num_classes)
+
+# 패치 데이터셋 생성
+mirror_image = mirror_hsi(height, width, band, input_normalize, patch=args.patches)
+x_train = create_dataset(mirror_image, total_pos_train, band, args.patches, args.band_patches)
+x_test = create_dataset(mirror_image, total_pos_test, band, args.patches, args.band_patches)
+x_true = create_dataset(mirror_image, total_pos_true, band, args.patches, args.band_patches)
+
+# PyTorch DataLoader 생성
+train_loader = Data.DataLoader(Data.TensorDataset(torch.from_numpy(x_train), torch.from_numpy(y_train).long()), batch_size=args.batch_size, shuffle=True)
+test_loader = Data.DataLoader(Data.TensorDataset(torch.from_numpy(x_test), torch.from_numpy(y_test).long()), batch_size=args.batch_size, shuffle=False)
+true_loader = Data.DataLoader(Data.TensorDataset(torch.from_numpy(x_true), torch.from_numpy(y_true).long()), batch_size=256, shuffle=False)
+
+# 모델, 손실 함수, 옵티마이저 정의
+model = ViT(
+    image_size=args.patches,
+    near_band=args.band_patches,
+    num_patches=band,
+    num_classes=num_classes,
+    dim=64, depth=5, heads=4, mlp_dim=8,
+    dropout=0.1, emb_dropout=0.1,
+    mode=args.mode
+).cuda()
+
+criterion = nn.CrossEntropyLoss().cuda()
+optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=args.epoches // 10, gamma=args.gamma)
+
+# --- 5. 메인 루프: 훈련 또는 테스트 실행 ---
+if args.flag_test == 'train':
+    print("\n--- Start Training ---")
+    tic = time.time()
+    best_oa = 0
+
+    for epoch in range(args.epoches):
+        train_acc, train_loss = train_epoch(model, train_loader, criterion, optimizer)
+        scheduler.step()
+
+        print(f"Epoch: {epoch + 1:03d}/{args.epoches:03d} | "
+              f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}%")
+
+        if (epoch + 1) % args.test_freq == 0 or (epoch + 1) == args.epoches:
+            tar_v, pre_v = valid_epoch(model, test_loader)
+            oa, aa, kappa, _ = output_metric(tar_v, pre_v)
+            print(f"  => Validation | OA: {oa:.4f} | AA: {aa:.4f} | Kappa: {kappa:.4f}")
+
+            if oa > best_oa:
+                best_oa = oa
+                torch.save(model.state_dict(), MODEL_FILENAME)
+                print(f"  => 🎉 New best model saved to {MODEL_FILENAME} with OA: {best_oa:.4f}")
+    
+    toc = time.time()
+    print(f"\n--- Training Finished in {toc - tic:.2f}s ---")
+    print("\n--- Final Evaluation with Best Model ---")
+    args.flag_test = 'test' # 훈련 후 테스트 모드로 전환
+
+if args.flag_test == 'test':
+    if not os.path.exists(MODEL_FILENAME):
+        raise FileNotFoundError(f"Model file not found at {MODEL_FILENAME}. Please train the model first.")
+        
+    model.load_state_dict(torch.load(MODEL_FILENAME))
+    print(f"Model loaded from {MODEL_FILENAME}")
+
+    final_tar, final_pre = valid_epoch(model, test_loader)
+    OA, AA, Kappa, class_acc = output_metric(final_tar, final_pre)
+    print(f"\n--- Final Test Metrics ---")
+    print(f"Overall Accuracy (OA): {OA:.4f}")
+    print(f"Average Accuracy (AA): {AA:.4f}")
+    print(f"Kappa Coefficient:     {Kappa:.4f}")
+    print("\nClass-wise Accuracies:")
+    for i, acc in enumerate(class_acc):
+        print(f"  Class {i+1:2d}: {acc:.4f}")
+        
+    test_and_visualize(model, true_loader, total_pos_true, y_true, height, width, color_matrix, label)
+
+print("\n--- Parameters Used ---")
+for k, v in vars(args).items():
+    print(f"{k}: {v}")
+print("-----------------------")
